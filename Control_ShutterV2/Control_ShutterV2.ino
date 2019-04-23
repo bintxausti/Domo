@@ -1,147 +1,93 @@
 
-/// INICIO DEL PROGRAMA ///
-
-
 #pragma region COMENTARIOS
 
-// Controlador ASCOM para BMDome1
-//
-// Description:	Driver para controlador de Domo desarrollado por Bilbaomakers
-//				para el proyecto de observatorio astronomico en Marcilla de Campos.
-//				Control de azimut de la cupula y apertura cierre del shutter.
-//				Hardware de control con Arduino y ESP8266
-//				Comunicaciones mediante MQTT
-//
-// Implements:	ASCOM Dome interface version: 6.4SP1
-// Author:		Diego Maroto - BilbaoMakers 2019 - info@bilbaomakers.org
-
-
-
-// Cosas a hacer en el futuro
 /*
 
-		- Implementar uno a varios Led WS2812 para informar del estado de lo importante
+Controlador ASCOM para BMDome1
+Description: Driver para controlador de Domo desarrollado por Bilbaomakers
+			 para el proyecto de observatorio astronomico en Marcilla de Campos.
+			 Control de azimut de la cupula y apertura cierre del shutter.
+			 Hardware de control con Arduino y ESP8266
+			 Comunicaciones mediante MQTT
+Implements:	 ASCOM Dome interface version: 6.4SP1
+Author:		 Diego Maroto - BilbaoMakers 2019 - info@bilbaomakers.org
+
+
+Cosas a hacer en el futuro
+
+- Implementar uno a varios Led WS2812 para informar del estado de lo importante
+- Implementar calculo de rotacion basado en mi posicion para "predecir" el movimiento del objeto y poder hacer seguimiento auntonomo automatico
 				
-*/
-
-// Cosas de configuracion a pasar desde el Driver
-
-/*
+Cosas de configuracion a pasar desde el Driver
 
 		- El Azimut cuando esta en HOME
 		- El Azimut del PARK
 
 
+NOTAS SOBRE EL STEPPER Y LA LIBRERIA ACCELSTEPPER
+
+- El ancho minimo de pulso que puede generar la libreria es 20uS, por tanto el periodo minimo es 40uS - Frecuencia Maxima 25Khz
+- Una velocidad de motor aceptable inicialmente son 50 revoluciones por minuto (50 tiene el motor de puerta corredera actual pero como soy un maniatico me gusta mas 60)
+- Eso es 1 vuelta por segundo en la reductora, que como es 1:6 son 6 revoluciones / segundo del motor
+- A 3200 pulsos por vuelta en la controladora, para 6 rev/segundo son 19200 pulsos por segundo. Es el maximo que puedo exprimir la libreria.
+- Determinaremos la velocidad optima de la cupula "in situ", originalmente probaremos mas lento cuando montemos.
+
+- Para ejecutar el comando "run" de la libreria Accelstepper vamos a usar la interrupcion de un timer.
+- ESP32 tiene 4 timers que funcionan a una frecuencia de 80 MHz (Ole!). Nos sobra "velocidad" que te cagas aqui
+- No tengo ni idea de cuantos ciclos de reloj usa el run() de la libreria (lo investigare a ver)
+
 */
 
-
 #pragma endregion
 
-
-#pragma region Includes de librerias usadas por el proyecto
-
+#pragma region INCLUDES
+// Librerias comantadas en proceso de sustitucion por la WiFiMQTTManager
 
 #include <SerialCommands.h>				// Libreria para la gestion de comandos por el puerto serie https://github.com/ppedro74/Arduino-SerialCommands
-#include <MQTTClient.h>					// Libreria MQTT: https://github.com/256dpi/arduino-mqtt
-#include <AccelStepper.h>				// Para controlar el stepper como se merece: https://www.airspayce.com/mikem/arduino/AccelStepper/classAccelStepper.html
-#include <FS.h>							// Libreria Sistema de Ficheros
-#include <ESP8266WiFi.h>			    // Para las comunicaciones WIFI
-#include <DNSServer.h>					// La necesita WifiManager para el portal captivo
-#include <ESP8266WebServer.h>			// La necesita WifiManager para el formulario de configuracion
-#include <WiFiManager.h>				// Para la gestion avanzada de la wifi
-#include <ArduinoJson.h>				// OJO: Tener instalada una version NO BETA (a dia de hoy la estable es la 5.13.4). Alguna pata han metido en la 6
-#include <string>						// Para el manejo de cadenas
-#include <Bounce2.h>					// Libreria para filtrar rebotes de los Switches: https://github.com/thomasfredericks/Bounce2
-#include <Wire.h>             // Librería para control de sensores que funcionan con One wire
-#include <LSM303.h>           // Librería del sensor giróscopo, magnetómetro, acelerómetro
-#include <DHT.h>               // Librería del sensor DHT11 para temperatura y humedad
+#include <AsyncMqttClient.h>			// Vamos a probar esta que es Asincrona: https://github.com/marvinroger/async-mqtt-client
+#include <AccelStepper.h>					// Para controlar el stepper como se merece: https://www.airspayce.com/mikem/arduino/AccelStepper/classAccelStepper.html
+#include <FS.h>										// Libreria Sistema de Ficheros
+#include <WiFi.h>									// Para las comunicaciones WIFI del ESP32
+#include <DNSServer.h>						// La necesita WifiManager para el portal captivo
+#include <WebServer.h>						// La necesita WifiManager para el formulario de configuracion (ESP32)
+//#include <WiFiManager.h>					// Para la gestion avanzada de la wifi
+#include <ArduinoJson.h>					// OJO: Tener instalada una version NO BETA (a dia de hoy la estable es la 5.13.4). Alguna pata han metido en la 6
+#include <string>									// Para el manejo de cadenas
+#include <Bounce2.h>							// Libreria para filtrar rebotes de los Switches: https://github.com/thomasfredericks/Bounce2
+#include <SPIFFS.h>								// Libreria para sistema de ficheros SPIFFS
+#include <Wire.h>								// **Librería para control del compás y otros dispositivos one wire
+#include <LSM303.h>								// **Librería para control del compás
+#include <DHTesp.h>								// **Librería para control del sensor de Temperatura y Humedad DHT11
 
 #pragma endregion
-
 
 #pragma region Constantes y configuracion. Modificable aqui por el usuario
 
-// Para el estado del controlador
-//#define ESTADO_CONTROLADOR_ERROR 0
-//#define ESTADO_CONTROLADOR_OFFLINE 1
-//#define ESTADO_CONTROLADOR_READY 2
+#define CONFIG_TASK_WDT_CHECK_IDLE_TASK_CPU1 0
 
 // Para la configuracion de conjunto Mecanico de arrastre
-/*static const uint8_t MECANICA_STEPPER_PULSEPIN = D2;				// Pin de pulsos del stepper
-static const uint8_t MECANICA_STEPPER_DIRPIN = D1;					// Pin de direccion del stepper
-static const uint8_t MECANICA_STEPPER_ENABLEPING = D0;				// Pin de enable del stepper
-static const boolean MECANICA_STEPPER_INVERTPINS = true;			// Invertir la logica de los pines de control (pulso 1 o pulso 0)
-static const float MECANICA_STEPPER_MAXSPEED = 1000;				// Velocidad maxima del stepper (pasos por segundo)
-static const float MECANICA_STEPPER_MAXACELERAION = 300;			// Aceleracion maxima del stepper
-static const short MECANICA_PASOS_POR_VUELTA_MOTOR = 400;			// Numero de pasos por vuelta del STEPPER
-static const short MECANICA_RATIO_REDUCTORA = 6;					// Ratio de reduccion de la reductora
-static const short MECANICA_DIENTES_PINON_ATAQUE = 15;				// Numero de dientes del pi�os de ataque
-static const short MECANICA_DIENTES_CREMALLERA_CUPULA = 880;		// Numero de dientes de la cremallera de la cupula
-*/
+//static const uint8_t MECANICA_STEPPER_PULSEPIN = 32;					// Pin de pulsos del stepper
+//static const uint8_t MECANICA_STEPPER_DIRPIN = 25;						// Pin de direccion del stepper
+//static const uint8_t MECANICA_STEPPER_ENABLEPING = 33;				// Pin de enable del stepper
+//static const short MECANICA_PASOS_POR_VUELTA_MOTOR = 400;		// Numero de pasos por vuelta del STEPPER (Configuracion del controlador)
+//static const float MECANICA_STEPPER_MAXSPEED = (MECANICA_PASOS_POR_VUELTA_MOTOR * 6);	// Velocidad maxima del stepper (pasos por segundo)
+//static const float MECANICA_STEPPER_MAXACELERAION = (MECANICA_STEPPER_MAXSPEED / 3);	// Aceleracion maxima del stepper (pasos por segundo2). Aceleraremos al VMAX en 3 vueltas del motor.
+//static const short MECANICA_RATIO_REDUCTORA = 6;							// Ratio de reduccion de la reductora
+//static const short MECANICA_DIENTES_PINON_ATAQUE = 16;				// Numero de dientes del piños de ataque
+//static const short MECANICA_DIENTES_CREMALLERA_CUPULA = 981;	// Numero de dientes de la cremallera de la cupula
+//static const boolean MECANICA_STEPPER_INVERTPINS = false;			// Invertir la logica de los pines de control (pulso 1 o pulso 0)
+//static const int MECANICA_STEPPER_ANCHO_PULSO = 20;						// Ancho de los pulsos
+
 // Otros sensores
-//static const uint8_t MECANICA_SENSOR_HOME = D5;						// Pin para el sensor de HOME
+//static const uint8_t MECANICA_SENSOR_HOME = 26;								// Pin para el sensor de HOME
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Para el ticker del BMDomo1
+//unsigned long TIEMPO_TICKER_RAPIDO = 500;
 
-// Incluir aquí los sensores del SHUTTER
-// Instancia a las clases Compass
-LSM303 compass;
-// Pins assigned to IMU Pololu  model: MinIMU9AHRS .......... SDA, SCL, Vin (a 5V) and GRND (ground). Connected to A4, A5, 5V,Gnd in Arduino Uno. 
-// In nodemcu and arduino Mega 2560 connect to respective pins.
- 
-// Pin assigned to DHT11 Temperature and Humidity sensor
-
-#define DHTPIN 2
-// Dependiendo del tipo de sensor
-#define DHTTYPE DHT11
- 
-// Inicializamos el sensor DHT11
-DHT dht(DHTPIN, DHTTYPE);
- 
-
-// Pin assigned to Switch1 closed shutter Digital pin
-int Switch1 =4;                       // El final de carrera de abajo en la que la compuerta estaría cerrada
-boolean Value1;
-
-// Pin assigned to Switch2 opened shutter Digital pin
-int Switch2= 5;                           // El final de carrera de arriba en el que la compuerta estaría abierta
-boolean Value2;
-// Pin assigned to Voltage sensor
-
-// //////////////  RELAY Declaration
-
-// Relay1 Motor on/off SPST
-int RelayspPin=6;
-
-// Relay2 Turn Right/Left DPDT
-int RelaydpPin=7;
-
-//////////////////////////////////////////////////////////////
-
-// Valores para los Tickers
-unsigned long TIEMPO_TICKER_LENTO = 10000;
-unsigned long TIEMPO_TICKER_RAPIDO = 2000;
 
 #pragma endregion
 
-
 #pragma region Variables y estructuras
-
-
-// Estructura para la configuracion del Stepper de Azimut
-//struct MECANICACFG
-//{
-
-	// Variables para el Stepper
-	/*uint8_t StepperPulse = MECANICA_STEPPER_PULSEPIN;
-	uint8_t StepperDir = MECANICA_STEPPER_DIRPIN;
-	uint8_t StepperEnable = MECANICA_STEPPER_ENABLEPING;
-	float StepperMaxSpeed = MECANICA_STEPPER_MAXSPEED;
-	float StepperAceleration = MECANICA_STEPPER_MAXACELERAION;
-*/
-
-//} MiConfigStepper;
-
 
 // Estructura para las configuraciones MQTT
 struct MQTTCFG
@@ -157,46 +103,31 @@ struct MQTTCFG
 	// Variables internas string para los nombres de los topics. Se les da valor luego al final del setup()
 	// El de comandos al que me voy a suscribir para "escuchar".
 	String cmndTopic;
-	// Y estos como son para publicar, defino la raiz de la jerarquia. Luego cuando publique ya a�ado al topic lo que necesite (por ejemplo tele/AZIMUT/LWT , etc ...)
 	String statTopic;
 	String teleTopic;
+	String lwtTopic;
 
 } MiConfigMqtt;
 
 
-// flag para saber si tenemos que salvar los datos en el fichero de configuracion.
-bool shouldSaveConfig = false;
-//bool shouldSaveConfig = true;
-
-// Para los timers
-// unsigned long millis1;
-
 #pragma endregion
-
 
 #pragma region Objetos
 
-
-// Wifimanager (aqui para que se vea tambien en el Loop)
-WiFiManager wifiManager;
-
 // Para la conexion MQTT
-WiFiClient Clientered;
-MQTTClient ClienteMQTT;
-
-long lastMsg = 0;
-char msg[50];
-int value = 0;
+AsyncMqttClient  ClienteMQTT;
 
 // Controlador Stepper
 //AccelStepper ControladorStepper;
 
-// Objetos debouncer para los switches
-Bounce Debouncer_HomeSwitch = Bounce();
 
+// Los manejadores para las tareas. El resto de las cosas que hace nuestro controlador que son un poco mas flexibles que la de los pulsos del Stepper
+TaskHandle_t THandleTaskCupulaRun,THandleTaskProcesaComandos,THandleTaskComandosSerieRun,THandleTaskMandaTelemetria,THandleTaskGestionRed,THandleTaskEnviaRespuestas;	
+
+// Manejadores Colas para comunicaciones inter-tareas
+QueueHandle_t ColaComandos,ColaRespuestas;
 
 #pragma endregion
-
 
 #pragma region CLASE BMDomo1 - Clase principial para el objeto que representa la cupula, sus estados, propiedades y acciones
 
@@ -214,8 +145,10 @@ private:
 	// Variables Internas para uso de la clase
 	bool Inicializando;						// Para saber que estamos ejecutando el comando INITHW
 	bool BuscandoCasa;						// Para saber que estamos ejecutando el comando FINDHOME
-	
-	
+	float TotalPasos;							// Variable para almacenar al numero de pasos totales para 360º (0) al iniciar el objeto.
+	Bounce Debouncer_HomeSwitch = Bounce(); // Objeto debouncer para el switch HOME
+
+		
 	// Funciones Callback. Son funciones "especiales" que yo puedo definir FUERA de la clase y disparar DENTRO (GUAY).
 	// Por ejemplo "una funcion que envie las respuestas a los comandos". Aqui no tengo por que decir ni donde ni como va a enviar esas respuestas.
 	// Solo tengo que definirla y cuando cree el objeto de esta clase en mi programa, creo la funcion con esta misma estructura y se la "paso" a la clase
@@ -224,13 +157,13 @@ private:
 	typedef void(*RespondeComandoCallback)(String comando, String respuesta);			// Definir como ha de ser la funcion de Callback (que le tengo que pasar y que devuelve)
 	RespondeComandoCallback MiRespondeComandos = nullptr;								// Definir el objeto que va a contener la funcion que vendra de fuera AQUI en la clase.
 
-	typedef void(*EnviaTelemetriaCallback)();											// Lo mismo para la funcion de envio de telemetria
-	EnviaTelemetriaCallback MiEnviadorDeTelemetria = nullptr;
-
+	long GradosToPasos(long grados);													// Convierte Grados a Pasos segun la mecanica
+	long PasosToGrados(long pasos);														// Convierte pasos a grados segun la mecanica
 	
+
 public:
 
-	BMDomo1();		// Constructor (es la funcion que devuelve un Objeto de esta clase)
+	BMDomo1(uint8_t PinHome);		// Constructor (es la funcion que devuelve un Objeto de esta clase)
 	~BMDomo1() {};	// Destructor (Destruye el objeto, o sea, lo borra de la memoria)
 
 
@@ -241,24 +174,18 @@ public:
 	bool HardwareOK;							// Si nosotros estamos listos para todo (para informar al driver del PC)
 	bool Slewing;								// Si alguna parte del Domo esta moviendose
 	bool AtHome;								// Si esta parada en HOME
-	unsigned long TickerLento;					// Ticker lento (envio de JSON Info, Reconexiones, etc .....)
-	unsigned long TickerRapido;					// Otro Ticker para cosas mas rapidas
-												
+													
 
 	// Funciones Publicas
-
-	String MiEstadoJson();											// Devuelve un JSON con los estados en un array de 100 chars (la libreria MQTT no puede con mas de 100)
-	//void MoveTo(int azimut);										// Mover la cupula a un azimut
-	void IniciaCupula(String parametros);											// Inicializar la cupula
-	//void FindHome();												// Mueve la cupula a Home
-	int GetCurrentAzimut();											// Devuelve el azimut actual de la cupula
+	String MiEstadoJson(int categoria);								// Devuelve un JSON con los estados en un array de 100 chars (la libreria MQTT no puede con mas de 100)
+	void MoveTo(int azimut);										// Mover la cupula a un azimut
+	void IniciaCupula(String parametros);							// Inicializar la cupula
+	void ApagaCupula(String parametros);							// Apagar la cupula normalmente.
+	void FindHome();												// Mueve la cupula a Home
+	long GetCurrentAzimut();									    // Devuelve el azimut actual de la cupula
 	void Run();														// Actualiza las propiedades de estado de este objeto en funcion del estado de motores y sensores
 	void SetRespondeComandoCallback(RespondeComandoCallback ref);	// Definir la funcion para pasarnos la funcion de callback del enviamensajes
-	void SetEnviaTelemetriaCallback(EnviaTelemetriaCallback ref);   // Definir la funcion para pasarnos la funcion de callback del enviaTelemetria
-	// del SHUTTER //////////////////////////////////////////////////////////////////////////////////
-  void MoveShutter(String parametros);                             //Indica a la compuerta si tiene que abrir, parar o cerrar.
-  void SensorShutter();                                            // Aquí se envian los datos de todos los sensores de la compuerta
-  /////////////////////////////////////////////////////////////////////////////////////////////
+		
 };
 
 #pragma endregion
@@ -267,7 +194,7 @@ public:
 #pragma region IMPLEMENTACIONES BMDomo1
 
 // Constructor. Lo que sea que haya que hacer antes de devolver el objeto de esta clase al creador.
-BMDomo1::BMDomo1() {	
+BMDomo1::BMDomo1(uint8_t PinHome) {	
 
 	HardwareInfo = "BMDome1.HWAz1.0";
 	Inicializando = false;
@@ -277,10 +204,48 @@ BMDomo1::BMDomo1() {
 	Slewing = false;			
 	BuscandoCasa = false;
 	AtHome = false;
-	TickerLento = millis();
-	TickerRapido = millis();
+	TotalPasos = (float)(MECANICA_DIENTES_CREMALLERA_CUPULA * MECANICA_RATIO_REDUCTORA * MECANICA_PASOS_POR_VUELTA_MOTOR) / (float)(MECANICA_DIENTES_PINON_ATAQUE);
+	// Inicializacion del sensor de HOMME
+	pinMode(PinHome, INPUT_PULLUP);
+	Debouncer_HomeSwitch.attach(PinHome);
+	Debouncer_HomeSwitch.interval(5);
+
+}
+
+#pragma region Funciones Privadas
+
+// Traduce Grados a Pasos segun la mecanica
+long BMDomo1::GradosToPasos(long grados) {
+
+	return round((float)(grados * TotalPasos) / 360);
 	
 }
+
+// Traduce Pasos a Grados segun la mecanica
+long BMDomo1::PasosToGrados(long pasos) {
+
+	// Con una pequeña correccion porque a veces si se pide la posicion por encima de 359.5 devuelve 360 (por el redondeo) y no vale, tiene que ser 0
+	long t_grados = round((float)(pasos * 360) / (float)TotalPasos);
+	
+	if (t_grados == 360) {
+
+		return 0;
+
+	}
+		
+	else {
+
+		return t_grados;
+
+	}
+}
+
+
+#pragma endregion
+
+
+#pragma region Funciones Publicas
+
 
 // Pasar a esta clase la funcion callback de fuera. Me la pasan desde el programa con el metodo SetRespondeComandoCallback
 void BMDomo1::SetRespondeComandoCallback(RespondeComandoCallback ref) {
@@ -289,31 +254,46 @@ void BMDomo1::SetRespondeComandoCallback(RespondeComandoCallback ref) {
 
 }
 
-// Pasar a esta clase la funcion callback de fuera. Me la pasan desde el programa con el metodo SetEnviaTelemetriaCallback
-void BMDomo1::SetEnviaTelemetriaCallback(EnviaTelemetriaCallback ref) {
-
-	MiEnviadorDeTelemetria = (EnviaTelemetriaCallback)ref;
-
-}
-
 // Metodo que devuelve un JSON con el estado
-String BMDomo1::MiEstadoJson() {
+String BMDomo1::MiEstadoJson(int categoria) {
 
-	// Esto crea un objeto de tipo JsonObject para el "contenedor de objetos a serializar". De tama�o Objetos + 1
-	const int capacity = JSON_OBJECT_SIZE(6);
+	// Esto crea un objeto de tipo JsonObject para el "contenedor de objetos a serializar". De tamaño Objetos + 1
+	const int capacity = JSON_OBJECT_SIZE(8);
 	StaticJsonBuffer<capacity> jBuffer;
-
 	//DynamicJsonBuffer jBuffer;
-
 	JsonObject& jObj = jBuffer.createObject();
 
-	// Esto llena de objetos de tipo "pareja propiedad valor"
-	jObj.set("HWAInf", HardwareInfo);						// Info del Hardware
-	jObj.set("COMSta", ComOK);								// Info de la conexion WIFI y MQTT
-	jObj.set("DRVSta", DriverOK);							// Info de la comunicacion con el DRIVER ASCOM (o quiza la cambiemos para comunicacion con "cualquier" driver, incluido uno nuestro
-	jObj.set("HWASta", HardwareOK);							// Info del estado de inicializacion de la mecanica
-	jObj.set("Az", GetCurrentAzimut());	// Posicion Actual (de momento en STEPS)
-	
+	// Dependiendo del numero de categoria en la llamada devolver unas cosas u otras
+	switch (categoria)
+	{
+
+	case 1:
+
+		// Esto llena de objetos de tipo "pareja propiedad valor"
+		jObj.set("HI", HardwareInfo);														// Info del Hardware
+		jObj.set("CS", ComOK);																	// Info de la conexion WIFI y MQTT
+		jObj.set("DS", DriverOK);																// Info de la comunicacion con el DRIVER ASCOM (o quiza la cambiemos para comunicacion con "cualquier" driver, incluido uno nuestro
+		jObj.set("HS", HardwareOK);															// Info del estado de inicializacion de la mecanica
+		jObj.set("AZ", GetCurrentAzimut());											// Posicion Actual (de momento en STEPS)
+		jObj.set("POS", ControladorStepper.currentPosition());  // Posicion en pasos del objeto del Stepper
+		jObj.set("TOT", TotalPasos);														// Numero total de pasos por giro de la cupula
+
+		break;
+
+	case 2:
+
+		jObj.set("INFO2", "INFO2");							
+		
+		break;
+
+	default:
+
+		jObj.set("NOINFO", "NOINFO");						// MAL LLAMADO
+
+		break;
+	}
+
+
 	// Crear un buffer (aray de 100 char) donde almacenar la cadena de texto del JSON
 	char JSONmessageBuffer[100];
 
@@ -322,7 +302,7 @@ String BMDomo1::MiEstadoJson() {
 
 	// devolver el char array con el JSON
 	return JSONmessageBuffer;
-
+	
 }
 
 // Metodos (funciones). TODAS Salvo la RUN() deben ser ASINCRONAS. Jamas se pueden quedar uno esperando. Esperar a lo bobo ESTA PROHIBIDISISISISMO, tenemos MUCHAS cosas que hacer ....
@@ -333,6 +313,8 @@ void BMDomo1::IniciaCupula(String parametros) {
 
 		HardwareOK = true;
 		MiRespondeComandos("INITHW", "READY");
+		ControladorStepper.enableOutputs();
+
 	}
 
 	else {
@@ -341,13 +323,13 @@ void BMDomo1::IniciaCupula(String parametros) {
 		Inicializando = true;
 
 		// Activar el motor. el resto del objeto Stepper ya esta OK
-	//	ControladorStepper.enableOutputs();
+		ControladorStepper.enableOutputs();
 
 		// Como el metodo ahora mismo es dar toda la vuelta, hago cero. Si cambio el metodo esto no valdria.
-	//	ControladorStepper.setCurrentPosition(0);
+		ControladorStepper.setCurrentPosition(0);
 
 		// Busca Home (Asyncrono)
-	//	FindHome();
+		FindHome();
 
 	}
 
@@ -356,7 +338,7 @@ void BMDomo1::IniciaCupula(String parametros) {
 }
 
 // Funcion que da orden de mover la cupula para esperar HOME.
-/*void BMDomo1::FindHome() {
+void BMDomo1::FindHome() {
 
 	
 	// Si la cupula no esta inicializada no hacemos nada mas que avisar
@@ -382,7 +364,7 @@ void BMDomo1::IniciaCupula(String parametros) {
 		else if (Slewing) {
 
 		
-			// Que nos estamos moviendo leeee no atosigues .....
+			// Que nos estamos moviendo leñe no atosigues .....
 			MiRespondeComandos("FINDHOME", "SLEWING");
 
 		}
@@ -404,20 +386,42 @@ void BMDomo1::IniciaCupula(String parametros) {
 	}
 
 }
-*/
 
 // Funcion que devuelva el azimut actual de la cupula
-int BMDomo1::GetCurrentAzimut() {
+long BMDomo1::GetCurrentAzimut() {
 
-	long t_azimut;
-	//t_azimut = (ControladorStepper.currentPosition() * MECANICA_DIENTES_PINON_ATAQUE * 360) / (MECANICA_DIENTES_CREMALLERA_CUPULA * MECANICA_RATIO_REDUCTORA * MECANICA_PASOS_POR_VUELTA_MOTOR);
-	//return round(t_azimut);
+	// Si los pasòs totales del stepper son mas o igual de los maximos (mas de 360º) restamos una vuelta. Luego en el loop cuando estemos parados corregiremos el valor de la libreria stepper
+	
+	long t_pasos = ControladorStepper.currentPosition();
+	if ( t_pasos < TotalPasos && t_pasos >= 0 ) {
+
+		return PasosToGrados(t_pasos);
+
+	}
+
+	else if (t_pasos >= TotalPasos && t_pasos >= 0) {
+
+		return PasosToGrados(t_pasos - TotalPasos);
+
+	}
+
+	else if (t_pasos <= 0)
+	{
+
+		return PasosToGrados(TotalPasos + t_pasos);
+
+	}
+		
+	else {
+
+		return 0;
+
+	}
 
 }
 
 // Funcion para mover la cupula a una posicion Azimut concreta
-/*void BMDomo1::MoveTo(int grados) {
-
+void BMDomo1::MoveTo(int grados) {
 
 
 	// Si la cupula no esta inicializada no hacemos nada mas que avisar
@@ -427,23 +431,51 @@ int BMDomo1::GetCurrentAzimut() {
 		
 	}
 
+	else if (Slewing) {
+
+		MiRespondeComandos("GOTO", "SLEWING");
+
+	}
+
 	else {
 
 		// Verificar que los grados no estan fuera de rango
 		if (grados >= 0 && grados <= 359) {
+			
+			// Si es aqui el comando es OK, nos movemos.
 
-			// A hacer para mover la cupula a un azimut determinado
+			// movimiento relativo a realiar
+			int delta = (grados - GetCurrentAzimut());
+			
+			
+			// Aqui el algoritmo para movernos con las opciones que tenemos de la libreria del Stepper (que no esta pensada para un "anillo" como es la cupula)
+			
+			int amover = 0;
+			
 
-		// Primero cambiar el estado Slewing
-		// No lo voy a hacer aqui. Lo hago en el run mirando el objeto stepper mejor, mas eficiente y limpio
-		//Slewing = true;
+			if (delta >= -180 && delta <= 180) {
 
-		// Traducir los grados a pulsos
-			long Pulsos = (MECANICA_DIENTES_CREMALLERA_CUPULA * MECANICA_RATIO_REDUCTORA * MECANICA_PASOS_POR_VUELTA_MOTOR * grados) / (MECANICA_DIENTES_PINON_ATAQUE * 360);
+				amover = delta;
+			
+			}
 
-			ControladorStepper.moveTo(Pulsos);
+			else if (delta > 180) {
 
-			MiRespondeComandos("GOTO", "OK " + String(grados) + " " + String(Pulsos));
+				amover = delta - 360;
+
+			}
+			
+			else if (delta < 180) {
+
+				amover = delta + 360;
+				
+			}
+			
+			MiRespondeComandos("GOTO", "OK_MOVE_TO: " + String(grados) + " REAL: " + String(amover));
+			
+			ControladorStepper.move(GradosToPasos(amover));
+				
+
 
 		}
 
@@ -452,63 +484,73 @@ int BMDomo1::GetCurrentAzimut() {
 			MiRespondeComandos("GOTO", "OUT_OF_RANGE");
 
 		}
-
 		
 
 	}
 	
 
 }
-*/
-
-
 
 // Esta funcion se lanza desde el loop. Es la que hace las comprobaciones. No debe atrancarse nunca tampoco (ni esta ni ninguna)
+void BMDomo1::Run() {
 
-/*void BMDomo1::Run() {
-
-
-	// Comprobaciones de iteracion con el Hardware. Como esto es MUY importante se comprueba siempre que es ejecuta el RUN
+	// Actualizar la lectura de los switches
+	Debouncer_HomeSwitch.update();
 
 	// Una importante es actualizar la propiedad Slewing con el estado del motor paso a paso. 
 	Slewing = ControladorStepper.isRunning();
 
-	// Leer el Switch de HOME y hacer cosas en funcion de otras cosas.
-	// Si esta PULSADO (LOW).
-	if (!Debouncer_HomeSwitch.read()) {
+	// Algunas cosas que hacemos en funcion si nos estamos moviendo o no
 
-		// Actualizar la propiedad ATHome
-		AtHome = true;
-		
-		// Pero es que ademas si esta pulsado, nos estamos moviendo y estamos "buscando casa" .....
-		if (BuscandoCasa && Slewing) {
+	if (Slewing) {
 
-			ControladorStepper.stop();					// Parar el motor que hemos llegado a HOME
-			ControladorStepper.setCurrentPosition(0);	// Poner la posicion a cero ("hacer cero")
-			
-			// Aqui como tenemos aceleraciones va a tardar en parar y nos vamos a pasar de home un cacho (afortunadamente un cacho conocido)
-			// Tendremos que volver para atras despacio el cacho que nos hemos pasado del Switch. Hay que hacer el calculo.
+		if (!Debouncer_HomeSwitch.read()) {
 
-			
-			BuscandoCasa = false;							// Cambiar el flag interno para saber que "ya no estamos buscando casa, ya hemos llegado"
-			MiRespondeComandos("FINDHOME", "ATHOME");		// Responder al comando FINDHOME
-				
-			if (Inicializando) {							// Si ademas estabamos haciendo esto desde el comando INITHW ....
+			// Actualizar la propiedad ATHome
+			AtHome = true;
 
-				Inicializando = false;						// Cambiar la variable interna para saber que "ya no estamos inicializando, ya hemos terminado"
-				MiRespondeComandos("INITHW", "READY");	// Responder al comando INITHW
+			// Pero es que ademas si esta pulsado, nos estamos moviendo y estamos "buscando casa" .....
+			if (BuscandoCasa) {
+
+				ControladorStepper.stop();					// Parar el motor que hemos llegado a HOME
+				ControladorStepper.setCurrentPosition(0);	// Poner la posicion a cero ("hacer cero")
+
+				// Aqui como tenemos aceleraciones va a tardar en parar y nos vamos a pasar de home un cacho (afortunadamente un cacho conocido)
+				// Tendremos que volver para atras despacio el cacho que nos hemos pasado del Switch. Hay que hacer el calculo.
+
+
+				BuscandoCasa = false;							// Cambiar el flag interno para saber que "ya no estamos buscando casa, ya hemos llegado"
+				MiRespondeComandos("FINDHOME", "ATHOME");		// Responder al comando FINDHOME
+
+				if (Inicializando) {							// Si ademas estabamos haciendo esto desde el comando INITHW ....
+
+					Inicializando = false;						// Cambiar la variable interna para saber que "ya no estamos inicializando, ya hemos terminado"
+					MiRespondeComandos("INITHW", "READY");	// Responder al comando INITHW
+
+				}
 
 			}
 
 		}
 
+		// Y si no esta pulsado .....
+		else
+		{
+			// Actualizamos la propiedad AtHome
+			AtHome = false;
+
+		}
+
 	}
-	
-	// Y si no esta pulsado .....
-	else
-	{
-		// Actualizamos la propiedad AtHome
-		AtHome = false;
+
+	else {
+
+		// Si la posicion del stepper en el objeto de su libreria esta fuera de rangos y estoy parado corregir
+		if (ControladorStepper.currentPosition() > TotalPasos || ControladorStepper.currentPosition() < 0) {
+
+			ControladorStepper.setCurrentPosition(GradosToPasos(GetCurrentAzimut()));
+
+		}
 
 	}
 
@@ -517,255 +559,34 @@ int BMDomo1::GetCurrentAzimut() {
 	// Un supuesto raro, pero eso es que no hemos conseguido detectar el switch home
 	if (!Slewing && BuscandoCasa) {
 
-		MiRespondeComandos("FINDHOME", "Failed");
+		MiRespondeComandos("FINDHOME", "FAILED_HOME_SW_ERROR");
 		BuscandoCasa = false;
 		Inicializando = false;
 				
 	}
-*/
-	   
-	// Aqui las cosas que hay que hacer cada TICKER_RAPIDO (ni tan rapido como las de arriba ni tan lento como las del TICKER_LENTO
-/*	if ((millis() - TickerRapido) >= TIEMPO_TICKER_RAPIDO) {
-
-		if (Slewing) {
-
-			MiRespondeComandos("GOTO", String(GetCurrentAzimut()));
-
-		}
-
-		//Actualizar el ticker para contar otro ciclo
-		TickerRapido = millis();
-
-	}
 	
-
-	// Aqui las cosas que tenemos que hacer cada TICKER LENTO
-	if ((millis() - TickerLento) >= TIEMPO_TICKER_LENTO ) {
-
-		// Comprobar si estamos conectados a la Wifi y si no reconectar SOLO SI NO NOS ESTAMOS MOVIENDO
-		// Porque esto no estoy seguro si bloquea el programa y si nos estamos moviendo atender al movimiento es lo mas importante
-		if (WiFi.status() != WL_CONNECTED && !ControladorStepper.isRunning()) {
-
-
-			Serial.println("HORROR!!: No estamos conectados a la WIFI.");
-			//WiFi.begin();
-
-		}
-*/
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-void BMDomo1::MoveShutter(String parametros) {
-
-  // Esto es para inicializar forzado si le pasamos parametro ABRIR
-  if (parametros == "ABRIR") {
- 
-    MiRespondeComandos("ABRIR", "READY");
-          
-// Poner aquí la lógica de abrirse la compuerta
-if (Value1==1 $ Value2==0) {                         // Comprueba que el switch1 de abajo está cerrado y el switch2 de arriba está abierto
-	digitalWrite(RelaydpPin,true);				// Cambia el sentido de giro del motor para que suba
-	digitalWrite(RelayspPin,true);				// Conecta el motor para que se mueva
-	delay(500);	
-	     }	
-	void SensorShutter();//Instrucción para leer de nuevo el switch1 y 2			// Espera 1/2 segundo para comprobar que ha arrancado (LEER DE NUEVO), se ha movido y ya el switch1 está abierto.
-else if Value1==1 {								// Si no es así, activa el rele DPDT para invertir el sentido de giro
-	digitalWrite(RelaydpPin,false);				// cambia el sentido de giro del motor
-else {
-}
-}
-	}
-  
-ClientMQTT.publish(MiConfigMqtt.statTopic +"/"+COMPUERTA,ABRIENDO,false,2);	// Informa via MQTT de que la compuerta se está abriendo
-
 }
 
+#pragma endregion
 
-  }
- 	 else if (parametros =="PARAR"){             //Esto es para inicializar forzado si le pasamos parametro PARAR
-
- MiRespondeComandos("PARAR", "READY");  
-
- digitalWrite(RelayspPin,false);				// Para el motor
-ClientMQTT.publish(MiConfigMqtt.statTopic +"/"+COMPUERTA,PARADA,false,2);	// Informa via MQTT de que la compuerta se ha parado
-    }
-
-	else if (parametros =="CERRAR"){             //Esto es para inicializar forzado si le pasamos parametro CERRAR
-
- MiRespondeComandos("CERRAR", "READY");
-// Poner aquí la lógica de cerrarse la compuerta
-if (Value1==0 $ Value2==1) {                         // Comprueba que el switch1 de abajo está cerrado y el switch2 de arriba está abierto
-	digitalWrite(RelaydpPin,true);				// Cambia el sentido de giro del motor para que suba
-	digitalWrite(RelayspPin,true);				// Conecta el motor para que se mueva
-	delay(500);	
-	     }	
-	void SensorShutter();//Instrucción para leer de nuevo el switch1 y 2			// Espera 1/2 segundo para comprobar que ha arrancado (LEER DE NUEVO), se ha movido y ya el switch1 está abierto.
-else if Value2==1 {								// Si no es así, activa el rele DPDT para invertir el sentido de giro
-	digitalWrite(RelaydpPin,false);				// cambia el sentido de giro del motor
-else{
-}
-}
-	}
-
-ClientMQTT.publish(MiConfigMqtt.statTopic +"/"+COMPUERTA,CERRANDO,false,2);	// Informa via MQTT de que la compuerta se está cerrando
-
-	}
-
-	if (value1==false $ value2==true & parametro="ABRIR"){               // ABIERTA. Cuando la compuerta llega arriba se cierra el switch2 y se corta la corriente
-digitalWrite(RelayspPin,false);				// Para el motor 
-ClientMQTT.publish(MiConfigMqtt.statTopic +"/"+COMPUERTA,ABIERTA,false,2);	// Informa via MQTT de que la compuerta está abierta	
-	}												
-   
-   
-   
-    if (value1==true $ value2==false & parametro="CERRAR"){               // CERRADA. Cuando la compuerta llega abajo se cierra el switch1 y se corta la corriente
-   digitalWrite(RelayspPin,false);				// Para el motor 
- ClientMQTT.publish(MiConfigMqtt.statTopic +"/"+COMPUERTA,CERRADA,false,2);	// Informa via MQTT de que la compuerta está cerrada 
-    }
-
-													
-
-
-
-void BMDomo1::SensorShutter() {                  // Aquí viene del loop y hace las mediciones de todos los sensores y las presenta en el puerto serie
- compass.read();
-
-  
-  
-  /*
-  When given no arguments, the heading() function returns the angular
-  difference in the horizontal plane between a default vector and
-  north, in degrees.
-  
-  The default vector is chosen by the library to point along the
-  surface of the PCB, in the direction of the top of the text on the
-  silkscreen. This is the +X axis on the Pololu LSM303D carrier and
-  the -Y axis on the Pololu LSM303DLHC, LSM303DLM, and LSM303DLH
-  carriers.
-  
-  To use a different vector as a reference, use the version of heading()
-  that takes a vector argument; for example, use
-  
-    compass.heading((LSM303::vector<int>){0, 0, 1});
-  
-  to use the +Z axis as a reference.
-  */
-  float heading = compass.heading();
-  // Compass heading display
-  
-  Serial.print("Rumbo: ");
-  Serial.print(heading);
-  Serial.print("  ");
- 
-// Leemos la humedad relativa del DHT11
-  float h = dht.readHumidity();
-  // Leemos la temperatura en grados centígrados (por defecto)
-  float t = dht.readTemperature();
-  // Leemos la temperatura en grados Fahreheit
-  float f = dht.readTemperature(true);
- 
-  // Comprobamos si ha habido algún error en la lectura
-  if (isnan(h) || isnan(t) || isnan(f)) {
-    Serial.println("Error obteniendo los datos del sensor DHT11");
- return;
-  }
-   // Calcular el índice de calor en Fahreheit
-  float hif = dht.computeHeatIndex(f, h);
-  // Calcular el índice de calor en grados centígrados
-  float hic = dht.computeHeatIndex(t, h, false);
- 
- // Show if switch is connected or not. Shutter closed or opened. If those values are 0, the shutter is in anywhere between.
-  Value1=digitalRead(Switch1);
-  Value2=digitalRead(Switch2);
-// Test of relay1. If switchClosed start. Control of these relays comes from Visual C#
-
-  digitalWrite(RelayspPin,Value1); // Set relay on, if switch is on. /// In final SW send another parameter from Visual C# to turn on this relay
-//digitalWrite(7,Value2);
-  // print out the state of the button:
-  
- 
- // print out the state of the button:
-  Serial.print("Humedad: ");
-  Serial.print(h);
-  Serial.print(" %\t");
-  Serial.print("Temperatura: ");
-  Serial.print(t);
-  Serial.print(" *C ");
-  Serial.print(f);
-  Serial.print(" *F\t");
-  Serial.print("Índice de calor: ");
-  Serial.print(hic);
-  Serial.print(" *C ");
-  Serial.print(hif);
-  Serial.print(" *F"); 
-  Serial.print("Compuerta cerrada: ");
-  Serial.print(Value1); 
-  Serial.print("Compuerta abierta: ");
-  Serial.print(Value2); 
-  Serial.print("Relé 1 On/off ");
-  Serial.println(Value1);
-    
-    delay(1000); 
-
-}
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-
-  
-		// Comprobar si estamos conectados a la wifi pero no al MQTT e intentar reconectar SOLO SI NO NOS ESTAMOS MOVIENDO
-		// Porque esto no estoy seguro si bloquea el programa y si nos estamos moviendo atender al movimiento es lo mas importante
-		else if (WiFi.status() == WL_CONNECTED && !ClienteMQTT.connected() && !ControladorStepper.isRunning()) {
-
-
-			Serial.println("HORROR!!: No estamos conectados al MQTT.");
-			ConectarMQTT();
-
-		}
-
-		// Y si estamos conectados a los dos enviar el JSON de Info (Aqui no importa si nos estamos moviendo porque esta CREO que es Asincrona
-		else
-		{
-
-			MiEnviadorDeTelemetria();
-			
-		}
-		
-		
-		//Actualizar el ticker para contar otro ciclo
-		TickerLento = millis();
-	}
-
-}
 
 #pragma endregion
 
 
 // Objeto de la clase BMDomo1. Es necesario definirlo aqui debajo de la definicion de clase. No puedo en la region de arriba donde tengo los demas
 // Eso es porque la clase usa objetos de fuera. Esto es chapuza pero de momento asi no me lio. Despues todo por referencia y la clase esta debajo de los includes o en una libreria a parte. Asi esntonces estaria OK.
-BMDomo1 MiCupula;
+BMDomo1 MiCupula(MECANICA_SENSOR_HOME);
 
 
 #pragma endregion
 
-
-
-#pragma region Funciones de la aplicacion
-
-
 #pragma region funciones de gestion de la configuracion
-
-// Funcion Callback disparada por el WifiManager para que sepamos que hay que hay una nueva configuracion que salvar (para los custom parameters).
-void saveConfigCallback() {
-	Serial.println("Lanzado SaveConfigCallback");
-	shouldSaveConfig = true;
-}
-
 
 // Funcion para leer la configuracion desde el fichero de configuracion
 void LeeConfig() {
 
-
-	if (SPIFFS.begin()) {
+	// El true es para formatear el sistema de ficheros si falla el montage. Si veo que hace cosas raras mejorar (no hacerlo siempre)
+	if (SPIFFS.begin(true)) {
 		Serial.println("Sistema de ficheros montado");
 		if (SPIFFS.exists("/config.json")) {
 			// Si existe el fichero abrir y leer la configuracion y asignarsela a las variables definidas arriba
@@ -806,7 +627,6 @@ void LeeConfig() {
 
 }
 
-
 // Funcion para Salvar la configuracion en el fichero de configuracion
 void SalvaConfig() {
 
@@ -834,188 +654,210 @@ void SalvaConfig() {
 
 #pragma endregion
 
+#pragma region Funciones de gestion de las conexiones Wifi
 
-#pragma region Funciones de gestion de las conexiones Wifi y MQTT
+// Funcion ante un evento de la wifi
+void WiFiEventCallBack(WiFiEvent_t event) {
+    
+		//Serial.printf("[WiFi-event] event: %d\n", event);
+    switch(event) {
+				
+		case SYSTEM_EVENT_STA_START:
+				Serial.println("Conexion WiFi: Iniciando ...");
+				break;
+    case SYSTEM_EVENT_STA_GOT_IP:
+        Serial.print("Conexion WiFi: Conetado. IP: ");
+        Serial.println(WiFi.localIP());
+        //FALTA: Conectar al MQTT pero NO se puede desde aqui (el Task de la Wifi me manda a tomar por culo por meterme en su terreno)
+        break;
+    case SYSTEM_EVENT_STA_DISCONNECTED:
+        Serial.println("Conexion WiFi: Desconetado");
+        //xTimerStop(mqttReconnectTimer, 0); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+				//xTimerStart(wifiReconnectTimer, 0);
+        break;
 
-// Funcion lanzada cuando entra en modo AP
-void APCallback(WiFiManager *wifiManager) {
-	Serial.println("Lanzado APCallback");
-	Serial.println(WiFi.softAPIP());
-	Serial.println(wifiManager->getConfigPortalSSID());
+		default:
+				break;
+
+    }
+		
 }
-
-
-// Para conectar al servidor MQTT y suscribirse a los topics
-void ConectarMQTT() {
-
-	// Intentar conectar al controlador MQTT.
-	if (ClienteMQTT.connect("ControladorAZ", MiConfigMqtt.mqtt_usuario, MiConfigMqtt.mqtt_password, false)) {
-
-		Serial.println("Conectado al MQTT");
-
-		// Suscribirse al topic de Entrada de Comandos
-		if (ClienteMQTT.subscribe(MiConfigMqtt.cmndTopic, 2)) {
-
-			// Si suscrito correctamente
-			Serial.println("Suscrito al topic " + MiConfigMqtt.cmndTopic);
-									
-
-		}
-		
-		else { Serial.println("Error Suscribiendome al topic " + MiConfigMqtt.cmndTopic); }
-
-			   
-		// funcion para manejar los MSG MQTT entrantes
-		ClienteMQTT.onMessage(MsgRecibido);
-
-		// Informar por puerto serie del topic LWT
-		Serial.println("Topic LWT: " + (MiConfigMqtt.teleTopic + "/LWT"));
-		
-		// Si llegamos hasta aqui es estado de las comunicaciones con WIFI y MQTT es OK
-		MiCupula.ComOK = true;
-		Serial.println("Controlador Azimut Iniciado Correctamente");
-		
-		
-		// Publicar un Online en el LWT
-		ClienteMQTT.publish(MiConfigMqtt.teleTopic + "/LWT", "Online", true, 2);
-
-		// Enviar el JSON de info al topic 
-		MandaTelemetria();
-
-	}
-
-	else {
-
-		Serial.println("Error Conectando al MQTT: " + String(ClienteMQTT.lastError()));
-		
-	}
-
-}
-
 
 #pragma endregion
 
+#pragma region Funciones de gestion de las conexiones MQTT
 
-#pragma region Funciones de implementacion de los comandos disponibles por MQTT
+// Manejador del evento de conexion al MQTT
+void onMqttConnect(bool sessionPresent) {
 
-
-// Funcion que se ejecuta cuando recibo un mensage MQTT. Decodificar aqui dentro.
-void MsgRecibido(String &topic, String &payload) {
-
-	// Nos basamos en que por ejemplo el comando GOTO 270 lo recibimos con un PAYLOAD 270 en el topic cmnd/XXXXXX/XXXXXX/GOTO
-
-	// Sacamos el prefijo del topic, o sea lo que hay delante de la primera /
-	int Indice1 = topic.indexOf("/");
-	String Prefijo = topic.substring(0, Indice1);
+	Serial.println("Conexion MQTT: Conectado. Core:" + String(xPortGetCoreID()));
 	
-	// Sacamos el "COMANDO" del topic, o sea lo que hay detras de la ultima /
-	int Indice2 = topic.lastIndexOf("/");
-	String Comando = topic.substring(Indice2 + 1);
+	bool susflag = false;
+	bool lwtflag = false;
+
+	
+	// Suscribirse al topic de Entrada de Comandos
+	if (ClienteMQTT.subscribe(MiConfigMqtt.cmndTopic.c_str(), 2)) {
+
+		// Si suscrito correctamente
+		Serial.println("Suscrito al topic " + MiConfigMqtt.cmndTopic);
+
+		susflag = true;				
+
+	}
 		
-	// Si el prefijo es cmnd se lo mandamos al manejador de comandos
-	if (Prefijo == "cmnd") { ManejadorComandos(Comando, payload); }
+	else { Serial.println("Error Suscribiendome al topic " + MiConfigMqtt.cmndTopic); }
+
+	
+	// Publicar un Online en el LWT
+	if (ClienteMQTT.publish((MiConfigMqtt.teleTopic + "/LWT").c_str(), 2,true,"Online")){
+
+		// Si llegamos hasta aqui es estado de las comunicaciones con WIFI y MQTT es OK
+		Serial.println("Publicado Online en Topic LWT: " + (MiConfigMqtt.teleTopic + "/LWT"));
+		
+		lwtflag = true;
+
+	}
+
+
+	if (!susflag || !lwtflag){
+
+		// Si falla la suscripcion o el envio del Online malo kaka. Me desconecto para repetir el proceso.
+		ClienteMQTT.disconnect(false);
+
+	}
+
+	else{
+
+		// Si todo ha ido bien, proceso de inicio terminado.
+		MiCupula.ComOK = true;
+		Serial.println("Controlador Azimut Iniciado Correctamente: MQTT-OK");
+
+	}
 
 
 }
 
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+  
+  Serial.println("Conexion MQTT: Desconectado.");
 
-// Maneja un comando con un parametro. De momento salvo necesidad SOLO 1 parametro
-String ManejadorComandos(String comando, String parametros) {
+}
 
-	// Y estas son las 3 variables con las que vamos a trabajar
+void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
+	//Serial.print("Subscripcion Realizada. PacketID: ");
+	//Serial.println(packetId);
+}
 
+void onMqttUnsubscribe(uint16_t packetId) {
+  //Serial.print("Subscricion Cancelada. PacketID: ");
+  //Serial.println(packetId);
+}
 
-	if (parametros.indexOf(" ") >> 0) {
+void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
+  
+	String s_topic = String(topic);
 
-		Serial.println("Me ha llegado un comando");
-		Serial.println("Comando: " + comando);
-		Serial.println("Parametro: " + parametros);
+	// CASCA SI NO VIENE PAYLOAD. MEJORAR
 
-		// COMANDO GOTO
-	/*	if (comando == "GOTO") {
+	if (payload != NULL){
 
-			// Mover la cupula
-			MiCupula.MoveTo(parametros.toInt());
+		//Serial.println("Me ha llegado un comando con payload NULL. Topic: " + String(topic));
 
-		}
-   */
+		// Lo que viene en el char* payload viene de un buffer que trae KAKA, hay que limpiarlo (para eso nos pasan len y tal)
+		char c_payload[len+1]; 										// Array para el payload y un hueco mas para el NULL del final
+		strlcpy(c_payload, payload, len+1); 			// Copiar del payload el tamaño justo. strcopy pone al final un NULL
+		
+		// Y ahora lo pasamos a String que esta limpito
+		String s_payload = String(c_payload);
 
-		// COMANDO STATUS
-		 if (comando == "STATUS") {
+		// Sacamos el prefijo del topic, o sea lo que hay delante de la primera /
+		int Indice1 = s_topic.indexOf("/");
+		String Prefijo = s_topic.substring(0, Indice1);
+		
+		// Si el prefijo es cmnd se lo mandamos al manejador de comandos
+		if (Prefijo == "cmnd") { 
 
-			MandaTelemetria();
-			MandaRespuesta("STATUS", "OK");
-		}
+			// Sacamos el "COMANDO" del topic, o sea lo que hay detras de la ultima /
+			int Indice2 = s_topic.lastIndexOf("/");
+			String Comando = s_topic.substring(Indice2 + 1);
 
-		// COMANDO STATUS
-		else if (comando == "FINDHOME") {
+			DynamicJsonBuffer jsonBuffer;
+			JsonObject& ObjJson = jsonBuffer.createObject();
+			ObjJson.set("COMANDO",Comando);
+			ObjJson.set("PAYLOAD",s_payload);
 
+			char JSONmessageBuffer[100];
+			ObjJson.printTo(JSONmessageBuffer, sizeof(JSONmessageBuffer));
+			//Serial.println(String(ObjJson.measureLength()));
+
+			// Mando el comando a la cola de comandos recibidos que luego procesara la tarea manejadordecomandos.
+			xQueueSend(ColaComandos, &JSONmessageBuffer, 0);
 			
-		//	MiCupula.FindHome();
-
-
 		}
-
-		// COMANDO STATUS
-		else if (comando == "INITHW") {
-
-
-			MiCupula.IniciaCupula(parametros);
-
-
-		}
-
-// COMANDO MOVESHUTTER
-else if (comando == "MOVESHUTTER") {
-   MiShutter.MoveShutter(parametros);
-		
-	}
-
-	else {
-
-		Serial.println("Me ha llegado un comando con demasiados parametros");
 
 	}
 
 }
 
+void onMqttPublish(uint16_t packetId) {
+  
+	// Al publicar no hacemos nada de momento.
 
-// Devuelve al topic correspondiente la respuesta a un comando. Esta funcion la uso como CALLBACK para el objeto cupula
-void MandaRespuesta(String comando, String respuesta) {
-				
-	ClienteMQTT.publish(MiConfigMqtt.statTopic + "/" + comando, respuesta, false, 2);
-	
 }
 
+// Manda a la cola de respuestas el mensaje de respuesta. Esta funcion la uso como CALLBACK para el objeto cupula
+void MandaRespuesta(String comando, String payload) {
+
+			String t_topic = MiConfigMqtt.statTopic + "/" + comando;
+
+			DynamicJsonBuffer jsonBuffer;
+			JsonObject& ObjJson = jsonBuffer.createObject();
+			// Tipo de mensaje (MQTT, SERIE, BOTH)
+			ObjJson.set("TIPO","BOTH");
+			// Comando
+			ObjJson.set("CMND",comando);
+			// Topic (para MQTT)
+			ObjJson.set("MQTTT",t_topic);
+			// RESPUESTA
+			ObjJson.set("RESP",payload);
+
+			char JSONmessageBuffer[300];
+			ObjJson.printTo(JSONmessageBuffer, sizeof(JSONmessageBuffer));
+			
+			// Mando el comando a la cola de comandos recibidos que luego procesara la tarea manejadordecomandos.
+			xQueueSend(ColaRespuestas, &JSONmessageBuffer, 0); 
+
+}
 
 // envia al topic tele la telemetria en Json
 void MandaTelemetria() {
 	
-	ClienteMQTT.publish(MiConfigMqtt.teleTopic + "/INFO", MiCupula.MiEstadoJson(), false, 2);
+	if (ClienteMQTT.connected()){
 
+			String t_topic = MiConfigMqtt.teleTopic + "/INFO1";
+
+			DynamicJsonBuffer jsonBuffer;
+			JsonObject& ObjJson = jsonBuffer.createObject();
+			ObjJson.set("TIPO","MQTT");
+			ObjJson.set("CMND","TELE");
+			ObjJson.set("MQTTT",t_topic);
+			ObjJson.set("RESP",MiCupula.MiEstadoJson(1));
+			
+			char JSONmessageBuffer[300];
+			ObjJson.printTo(JSONmessageBuffer, sizeof(JSONmessageBuffer));
+			
+			// Mando el comando a la cola de comandos recibidos que luego procesara la tarea manejadordecomandos.
+			xQueueSendToBack(ColaRespuestas, &JSONmessageBuffer, 0); 
+
+	}
+	
 }
 
 
 #pragma endregion
 
-
 #pragma region Funciones de implementacion de los comandos disponibles por el puerto serie
-
-// Objetos Comandos
-SerialCommand cmd_WIFI("WIFI", cmd_WIFI_hl);
-SerialCommand cmd_MQTTSrv("MQTTSrv", cmd_MQTTSrv_hl);
-SerialCommand cmd_MQTTUser("MQTTUser", cmd_MQTTUser_hl);
-SerialCommand cmd_MQTTPassword("MQTTPassword", cmd_MQTTPassword_hl);
-SerialCommand cmd_MQTTTopic("MQTTTopic", cmd_MQTTTopic_hl);
-SerialCommand cmd_SaveConfig("SaveConfig", cmd_SaveConfig_hl);
-SerialCommand cmd_Prueba("Prueba", cmd_Prueba_hl);
-
-// Buffer para los comandos. Gordote para el comando Wifi que lleva parametros gordos.
-char serial_command_buffer_[120];
-
-// Bind del objeto con el puerto serie usando el buffer
-SerialCommands serial_commands_(&Serial, serial_command_buffer_, sizeof(serial_command_buffer_), "\r\n", " ");
-
 
 // Manejadores de los comandos. Aqui dentro lo que queramos hacer con cada comando.
 void cmd_WIFI_hl(SerialCommands* sender)
@@ -1058,7 +900,6 @@ void cmd_MQTTSrv_hl(SerialCommands* sender)
 		return;
 	}
 
-	ClienteMQTT.setHost(parametro);
 	strcpy(MiConfigMqtt.mqtt_server, parametro);
 
 	sender->GetSerial()->println("MQTTSrv: " + String(parametro));
@@ -1124,7 +965,7 @@ void cmd_SaveConfig_hl(SerialCommands* sender)
 void cmd_Prueba_hl(SerialCommands* sender)
 {
 
-	ManejadorComandos("STATUS", "NADA");
+	
 
 }
 
@@ -1137,80 +978,222 @@ void cmd_error(SerialCommands* sender, const char* cmd)
 	sender->GetSerial()->println("]");
 }
 
+// Objetos Comandos
+SerialCommand cmd_WIFI("WIFI", cmd_WIFI_hl);
+SerialCommand cmd_MQTTSrv("MQTTSrv", cmd_MQTTSrv_hl);
+SerialCommand cmd_MQTTUser("MQTTUser", cmd_MQTTUser_hl);
+SerialCommand cmd_MQTTPassword("MQTTPassword", cmd_MQTTPassword_hl);
+SerialCommand cmd_MQTTTopic("MQTTTopic", cmd_MQTTTopic_hl);
+SerialCommand cmd_SaveConfig("SaveConfig", cmd_SaveConfig_hl);
+SerialCommand cmd_Prueba("Prueba", cmd_Prueba_hl);
+
+// Buffer para los comandos. Gordote para el comando Wifi que lleva parametros gordos.
+char serial_command_buffer_[120];
+
+// Bind del objeto con el puerto serie usando el buffer
+SerialCommands serial_commands_(&Serial, serial_command_buffer_, sizeof(serial_command_buffer_), "\r\n", " ");
 
 
 #pragma endregion
 
+#pragma region TASKS
 
-#pragma region Otras funciones Auxiliares
+
+// Tarea para vigilar la conexion con el MQTT y conectar si no estamos conectados
+void TaskGestionRed ( void * parameter ) {
+
+	TickType_t xLastWakeTime;
+	const TickType_t xFrequency = 10000;
+	xLastWakeTime = xTaskGetTickCount ();
 
 
-// Funcion que imprime la informacion de la red por el puerto serie
-void ImprimeInfoRed() {
+	while(true){
 
-	Serial.println("Configuracion de Red:");
-	Serial.print("IP: ");
-	Serial.println(WiFi.localIP());
-	Serial.print("      ");
-	Serial.println(WiFi.subnetMask());
-	Serial.print("GW: ");
-	Serial.println(WiFi.gatewayIP());
+		if (WiFi.isConnected() && !ClienteMQTT.connected()){
+			
+			ClienteMQTT.connect();
+			
+		}
+		
+		vTaskDelayUntil( &xLastWakeTime, xFrequency );
+
+	}
 
 }
 
+//Tarea para procesar la cola de comandos recibidos
+void TaskProcesaComandos ( void * parameter ){
 
-#pragma endregion	
+	TickType_t xLastWakeTime;
+	const TickType_t xFrequency = 100;
+	xLastWakeTime = xTaskGetTickCount ();
+
+	char JSONmessageBuffer[100];
+	
+	while (true){
+			
+			// Limpiar el Buffer
+			memset(JSONmessageBuffer, 0, sizeof JSONmessageBuffer);
+
+			if (xQueueReceive(ColaComandos,&JSONmessageBuffer,0) == pdTRUE ){
+
+				//Serial.println("Procesando comando: " + String(JSONmessageBufferRX));
+
+				String COMANDO;
+				String PAYLOAD;
+				DynamicJsonBuffer jsonBuffer;
+
+				JsonObject& ObjJson = jsonBuffer.parseObject(JSONmessageBuffer);
+
+				//json.printTo(Serial);
+				if (ObjJson.success()) {
+					
+
+					COMANDO = ObjJson["COMANDO"].as<String>();
+					PAYLOAD = ObjJson["PAYLOAD"].as<String>();
+					
+
+					if (PAYLOAD.indexOf(" ") >> 0) {
+					
+						// COMANDO GOTO
+						if (COMANDO == "GOTO") {
+
+							// Mover la cupula
+							// Vamos a tragar con decimales (XXX.XX) pero vamos a redondear a entero con la funcion round().
+							MiCupula.MoveTo(round(PAYLOAD.toFloat()));
+
+						}
+
+						// COMANDO STATUS
+						else if (COMANDO == "FINDHOME") {
+
+							
+							MiCupula.FindHome();
 
 
-#pragma endregion
+						}
 
+						// COMANDO STATUS
+						else if (COMANDO == "INITHW") {
 
+							MiCupula.IniciaCupula(PAYLOAD);
 
+						}
+						
+					}
 
-#pragma region Funcion Setup() y Loop() de ARDUINO
+					else {
 
-// funcion SETUP de Arduino
-void setup() {
+						Serial.print("Me ha llegado un comando con demasiados parametros: ");
+						Serial.println(JSONmessageBuffer);
 
-	// Instanciar el objeto MiCupula. Se inicia el solo (o deberia) con las propiedades en estado guay
-	MiCupula = BMDomo1();
-	// Asignar funciones Callback de Micupula
-	MiCupula.SetRespondeComandoCallback(MandaRespuesta);
-	MiCupula.SetEnviaTelemetriaCallback(MandaTelemetria);
+					}
 
-///////////////////////////////////////////////////////////////////////////
-// Shutter
+				
 
-    Wire.begin();
-  
-    // Compass initialization
-    compass.init();
-    compass.enableDefault();
+				}
 
-     // Comenzamos el sensor DHT
-    dht.begin();
-  
-  /*
-  Calibration values; the default values of +/-32767 for each axis
-  lead to an assumed magnetometer bias of 0. Use the Calibrate example
-  program to determine appropriate values for your particular unit.
-  */
-  compass.m_min = (LSM303::vector<int16_t>){-32767, -32767, -32767};
-  compass.m_max = (LSM303::vector<int16_t>){+32767, +32767, +32767};
+				else {
 
- // make the pushbutton's pin an input. Limit switch
-  pinMode(4, INPUT);
-  // make the pin 6 an output to activate Relay1:
- 
-  pinMode(6,OUTPUT);
+						Serial.print("Me ha llegado un comando que no puedo Deserializar: ");
+						Serial.println(JSONmessageBuffer);
 
-    
+				}
+
+				
+
+			}
+		
+		vTaskDelayUntil( &xLastWakeTime, xFrequency );
+
+	}
+
 }
-///////////////////////////////////////////////////////////////////////////////////////////////
-	// Puerto Serie
-	Serial.begin(115200);
-	Serial.println();
-	// A�adir los comandos al objeto manejador de comandos serie
+
+// Tarea para procesar la cola de respuestas
+void TaskEnviaRespuestas( void * parameter ){
+
+	TickType_t xLastWakeTime;
+	const TickType_t xFrequency = 100;
+	xLastWakeTime = xTaskGetTickCount ();
+	
+	char JSONmessageBuffer[300];
+	
+
+	while(true){
+
+		// Limpiar el Buffer
+		memset(JSONmessageBuffer, 0, sizeof JSONmessageBuffer);
+
+		if (xQueueReceive(ColaRespuestas,&JSONmessageBuffer,0) == pdTRUE ){
+
+				DynamicJsonBuffer jsonBuffer;
+
+				JsonObject& ObjJson = jsonBuffer.parseObject(JSONmessageBuffer);
+
+				if (ObjJson.success()) {
+					
+					String TIPO = ObjJson["TIPO"].as<String>();
+					String CMND = ObjJson["CMND"].as<String>();
+					String MQTTT = ObjJson["MQTTT"].as<String>();
+					String RESP = ObjJson["RESP"].as<String>();
+					String resp_topic = MiConfigMqtt.teleTopic + "/RESPONSE";
+
+					if (TIPO == "BOTH"){
+
+						ClienteMQTT.publish(MQTTT.c_str(), 2, false, RESP.c_str());
+						if (CMND != "TELE") {ClienteMQTT.publish(resp_topic.c_str(), 2, false, RESP.c_str());}
+						Serial.println(CMND + " " + RESP);
+						
+					}
+
+					else 	if (TIPO == "MQTT"){
+
+						ClienteMQTT.publish(MQTTT.c_str(), 2, false, RESP.c_str());
+						if (CMND != "TELE") {ClienteMQTT.publish(resp_topic.c_str(), 2, false, RESP.c_str());}
+																		
+					}
+					
+					else 	if (TIPO == "SERIE"){
+
+							Serial.println(CMND + " " + RESP);
+						
+					}
+						
+				}
+		}
+
+		vTaskDelayUntil( &xLastWakeTime, xFrequency );
+
+	}
+
+}
+
+// Tarea para el metodo run del objeto de la cupula.
+void TaskCupulaRun( void * parameter ){
+
+	TickType_t xLastWakeTime;
+	const TickType_t xFrequency = 100;
+	xLastWakeTime = xTaskGetTickCount ();
+	
+	while(true){
+
+		MiCupula.Run();
+
+		vTaskDelayUntil( &xLastWakeTime, xFrequency );
+
+	}
+
+}
+
+// Tarea para los comandos que llegan por el puerto serie
+void TaskComandosSerieRun( void * parameter ){
+
+	TickType_t xLastWakeTime;
+	const TickType_t xFrequency = 100;
+	xLastWakeTime = xTaskGetTickCount ();
+
+	// Añadir los comandos al objeto manejador de comandos serie
 	serial_commands_.AddCommand(&cmd_WIFI);
 	serial_commands_.AddCommand(&cmd_MQTTSrv);
 	serial_commands_.AddCommand(&cmd_MQTTUser);
@@ -1218,212 +1201,313 @@ void setup() {
 	serial_commands_.AddCommand(&cmd_MQTTTopic);
 	serial_commands_.AddCommand(&cmd_SaveConfig);
 	serial_commands_.AddCommand(&cmd_Prueba);
+	
 	// Manejador para los comandos Serie no reconocidos.
 	serial_commands_.SetDefaultHandler(&cmd_error);
 
-	// Formatear el sistema de ficheros SPIFFS (para limipar el ESP)
-	// SPIFFS.format();
-
-
-	// Inicializacion de las GPIO
-/*
-	pinMode(MECANICA_SENSOR_HOME, INPUT_PULLUP);
-	Debouncer_HomeSwitch.attach(MECANICA_SENSOR_HOME);
-	Debouncer_HomeSwitch.interval(5);
+	while(true){
 		
-*/
+		serial_commands_.ReadSerial();
+		
+		vTaskDelayUntil( &xLastWakeTime, xFrequency );
 
-	// Leer la configuracion que hay en el archivo de configuracion config.json
+	}
+	
+}
+
+// tarea para el envio periodico de la telemetria
+void TaskMandaTelemetria( void * parameter ){
+
+	TickType_t xLastWakeTime;
+	const TickType_t xFrequency = 2000;
+	xLastWakeTime = xTaskGetTickCount ();
+	
+
+	while(true){
+
+		MandaTelemetria();
+		
+		vTaskDelayUntil( &xLastWakeTime, xFrequency );
+
+	}
+	
+}
+
+#pragma endregion
+
+
+#pragma region Declaración de variables en COMPUERTA
+
+////////////////////////////////////////////////////////////////////////
+//******** Sensor declaration
+
+// Pin assigned to LED
+const int ledPin = 13;
+// Instancia a las clases Compass
+LSM303 compass;
+// Pins assigned to IMU Pololu  model: MinIMU9AHRS .......... SDA, SCL, Vin (a 5V) and GRND (ground). Connected to A4, A5, 5V,Gnd in Arduino Uno. 
+// In nodemcu and arduino Mega 2560 connect to respective pins.
+// SDA pin21 y SCL pin22
+// Pin assigned to DHT11 Temperature and Humidity sensor
+
+#define dhtPin 16    //D16 
+// El tipo de sensor se define en el set up
+
+ 
+// Inicializamos el sensor DHT11
+DHTesp dht;
+TaskHandle_t tempTaskHandle=NULL;
+
+// Pin assigned to Switch1 closed shutter Digital pin
+int SwitchDownPin =5;
+bool Value1;
+//Value1=false;
+
+
+// Pin assigned to Switch2 opened shutter Digital pin
+int SwitchUpPin= 17;
+bool Value2;
+//Value2=false;
+// Pin assigned to Voltage sensor
+
+// //////////////  RELAY Declaration
+
+// Relay1 Motor on/off SPST
+int Rele1Pin=19;
+
+// Relay2 Turn Right/Left DPDT
+int Rele2Pin=4
+
+
+#pragma endregion
+
+#pragma region Funcion Setup() de ARDUINO
+
+// funcion SETUP de Arduino
+void setup() {
+
+	// Puerto Serie
+	Serial.begin(115200);
+	Serial.println();
+
+	Serial.println("-- Iniciando Controlador Azimut --");
+
+	// Asignar funciones Callback de Micupula
+	MiCupula.SetRespondeComandoCallback(MandaRespuesta);
+		
+		// Leer la configuracion que hay en el archivo de configuracion config.json
 	Serial.println("Leyendo fichero de configuracion");
 	LeeConfig();
-	   	
-
-#pragma region Configuracion e inicializacion de la WIFI y el MQTT
-
-	// A�adir al wifimanager parametros para el MQTT
-	WiFiManagerParameter custom_mqtt_server("server", "mqtt server", MiConfigMqtt.mqtt_server, 40);
-	WiFiManagerParameter custom_mqtt_port("port", "mqtt port", MiConfigMqtt.mqtt_port, 5);
-	WiFiManagerParameter custom_mqtt_topic("topic", "mqtt topic", MiConfigMqtt.mqtt_topic, 34);
-	WiFiManagerParameter custom_mqtt_usuario("usuario", "mqtt user", MiConfigMqtt.mqtt_usuario, 20);
-	WiFiManagerParameter custom_mqtt_password("password", "mqtt password", MiConfigMqtt.mqtt_password, 20);
-
-	// Configurar el WiFiManager
-
-	// Borrar la configuracion SSID y Password guardadas en EEPROM (Teoricamente esto hay que hacer despues de hace autoconect no se si esta bien aqui esto)
-	//wifiManager.resetSettings();
-
-	wifiManager.setDebugOutput(false);
-
-	// Definirle la funcion para aviso de que hay que salvar la configuracion
-	wifiManager.setSaveConfigCallback(saveConfigCallback);
-
-	// Definirle la funcion que se dispara cuando entra en modo AP
-	wifiManager.setAPCallback(APCallback);
-
-
-	// Lo hago directamente en el objeto WIFI porque a traves del Wifimanager no puedo darle el DNS para que me resuelva cositas.
-	// WiFi.config(_ip, _gw, _sn, _dns, _dns);
-	// Y asi pilla por DHCP
-	WiFi.begin();
-    
-	// A�adir mis parametros custom
-
-	wifiManager.addParameter(&custom_mqtt_server);
-	wifiManager.addParameter(&custom_mqtt_port);
-	wifiManager.addParameter(&custom_mqtt_topic);
-	//wifiManager.addParameter(&custom_mqtt_usuario);
-	//wifiManager.addParameter(&custom_mqtt_password);
-
-
-	// Definir Calidad de Se�al Minima para mantenerse conectado.
-	// Por defecto sin parametros 8%
-	wifiManager.setMinimumSignalQuality();
-
-	// Definir la salida de Debug por el serial del WifiManager
-	wifiManager.setDebugOutput(false);
-
-	// Arrancar yo la wifi a mano si quiero ponerle yo aqui una wifi. Si no el wifiManager va a pillar la configuracion de la EEPROM
-	//Serial.println(WiFi.begin("MIWIFI", "MIPASSWORD"));
 	
-	// Timeout para que si no configuramos el portal AP se cierre
-	wifiManager.setTimeout(300);
-
-	
-	// Gestion de la conexion a la Wifi, Si NO estamos conectados por puerto serie lanza el portatl del WifiManager
-	Serial.println("Intentando Conectar a la Wifi .....");
-
-	if (Serial) {
-
-		if (!WiFi.begin() == WL_CONNECTED) {
-
-			Serial.println("Conexion Wifi OK. SSID: " + String(WiFi.SSID()));
-
-		}
-
-		else {
-
-			Serial.println("Conexion Wifi Fallida. Reconfigurala mediante comando WIFI");
-
-		}
-
-	}
-		
-	else {
-
-		if (wifiManager.autoConnect("BMDomo1", "BMDomo1")) {
-
-			Serial.println("Conexion Wifi OK. SSID: " + String(WiFi.SSID()));
-			
-		}
-
-		else {
-
-			Serial.println("Conexion Wifi Fallida.");
-			
-		}
-
-	}
-	
-	
-	// Leer los parametros custom que tiene el wifimanager por si los he actualizado yo en modo AP
-	strcpy(MiConfigMqtt.mqtt_server, custom_mqtt_server.getValue());
-	strcpy(MiConfigMqtt.mqtt_port, custom_mqtt_port.getValue());
-	strcpy(MiConfigMqtt.mqtt_topic, custom_mqtt_topic.getValue());
-
-
-	// Salvar la configuracion en el fichero de configuracion
-	if (shouldSaveConfig) {
-
-		SalvaConfig();
-	}
+	// MQTT
+	ClienteMQTT = AsyncMqttClient();
 
 	// Dar valor a las strings con los nombres de la estructura de los topics
 	MiConfigMqtt.cmndTopic = "cmnd/" + String(MiConfigMqtt.mqtt_topic) + "/#";
 	MiConfigMqtt.statTopic = "stat/" + String(MiConfigMqtt.mqtt_topic);
 	MiConfigMqtt.teleTopic = "tele/" + String(MiConfigMqtt.mqtt_topic);
-			
-	// Construir el cliente MQTT con el objeto cliente de la red wifi y combiar opciones
-	ClienteMQTT.begin(MiConfigMqtt.mqtt_server, 1883, Clientered);
-	ClienteMQTT.setOptions(5, false, 3000);
+	MiConfigMqtt.lwtTopic = MiConfigMqtt.teleTopic + "/LWT";
+
+	// Las funciones callback de la libreria MQTT	
+	ClienteMQTT.onConnect(onMqttConnect);
+  ClienteMQTT.onDisconnect(onMqttDisconnect);
+  ClienteMQTT.onSubscribe(onMqttSubscribe);
+  ClienteMQTT.onUnsubscribe(onMqttUnsubscribe);
+  ClienteMQTT.onMessage(onMqttMessage);
+  ClienteMQTT.onPublish(onMqttPublish);
+  ClienteMQTT.setServer(MiConfigMqtt.mqtt_server, 1883);
+	ClienteMQTT.setCleanSession(true);
+	ClienteMQTT.setClientId("ControlAzimut");
+	ClienteMQTT.setCredentials(MiConfigMqtt.mqtt_usuario,MiConfigMqtt.mqtt_password);
+	ClienteMQTT.setKeepAlive(4);
+	ClienteMQTT.setWill(MiConfigMqtt.lwtTopic.c_str(),2,true,"Offline");
+
+	// WIFI
+	WiFi.onEvent(WiFiEventCallBack);
+	WiFi.begin();
 	
-	// Crear el topic LWT
-	ClienteMQTT.setWill((MiConfigMqtt.teleTopic + "/LWT").c_str(), "Offline", true, 2);
-
-	// Esperar un poquito para que se acabe de conectar la wifi bien
-	delay(2000);
-
-	// Si la conexion a la wifi es OK ......
-	if (WiFi.status() == WL_CONNECTED) {
-		
-		Serial.println("Estoy conectado a la WIFI. Conectando al Broker MQTT");
-		
-		ImprimeInfoRed();
-		
-		ConectarMQTT();
-								
-	}
-
-#pragma endregion
-
-
-#pragma region Configuracion Objeto Stepper
-/*
-
 	// Instanciar el controlador de Stepper.
-	ControladorStepper = AccelStepper(AccelStepper::DRIVER, MiConfigStepper.StepperPulse, MiConfigStepper.StepperDir);
+	ControladorStepper = AccelStepper(AccelStepper::DRIVER, MECANICA_STEPPER_PULSEPIN , MECANICA_STEPPER_DIRPIN);
 	ControladorStepper.disableOutputs();
 	ControladorStepper.setCurrentPosition(0);
-	ControladorStepper.setEnablePin(MiConfigStepper.StepperEnable);
-	ControladorStepper.setMaxSpeed(MiConfigStepper.StepperMaxSpeed);
-	ControladorStepper.setAcceleration(MiConfigStepper.StepperAceleration);
+	ControladorStepper.setEnablePin(MECANICA_STEPPER_ENABLEPING);
+	ControladorStepper.setMaxSpeed(MECANICA_STEPPER_MAXSPEED);
+	ControladorStepper.setAcceleration(MECANICA_STEPPER_MAXACELERAION);
 	ControladorStepper.setPinsInverted(MECANICA_STEPPER_INVERTPINS, MECANICA_STEPPER_INVERTPINS, MECANICA_STEPPER_INVERTPINS);
-	//ControladorStepper.setMinPulseWidth(30); // Ancho minimo de pulso en microsegundos
+	ControladorStepper.setMinPulseWidth(MECANICA_STEPPER_ANCHO_PULSO); // Ancho minimo de pulso en microsegundos
+
+	// COLAS
+	ColaComandos = xQueueCreate(10,100);
+	ColaRespuestas = xQueueCreate(10,300);
+
+	// TASKS
+	Serial.println("Creando tareas ...");
+	
+
+	// Tareas CORE0 gestinadas por FreeRTOS
+	xTaskCreatePinnedToCore(TaskGestionRed,"MQTT_Conectar",3000,NULL,1,&THandleTaskGestionRed,0);
+	xTaskCreatePinnedToCore(TaskProcesaComandos,"ProcesaComandos",2000,NULL,1,&THandleTaskProcesaComandos,0);
+	xTaskCreatePinnedToCore(TaskEnviaRespuestas,"EnviaMQTT",2000,NULL,1,&THandleTaskEnviaRespuestas,0);
+	xTaskCreatePinnedToCore(TaskCupulaRun,"CupulaRun",2000,NULL,1,&THandleTaskCupulaRun,0);
+	xTaskCreatePinnedToCore(TaskMandaTelemetria,"MandaTelemetria",2000,NULL,1,&THandleTaskMandaTelemetria,0);
+	xTaskCreatePinnedToCore(TaskComandosSerieRun,"ComandosSerieRun",1000,NULL,1,&THandleTaskComandosSerieRun,0);
+	
+	// Tareas CORE1. No lanzo ninguna lo hago en el loop() que es una tarea unica en el CORE1
+	// Lo hago asi porque necesito muchisima velocidad y FreeRTOS solo puede cambiar entre tareas a 1Khz.
+	
+	Serial.println("Sistema Iniciado");
+
+	// Esto estaria guay, pero dispara el Watchdog en la CPU1
+	//portDISABLE_INTERRUPTS();
+
+	// Esto creo que no hace nada
+	portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+	portENTER_CRITICAL(&mux);
+	
+/* Código setup del SHUTTER
+//////////////////////
+/
+/////////////////////////
+***********************/
+	
+	Wire.begin();
+
+  
+// LED control
+pinMode (ledPin, OUTPUT);
+
+// Compass initialization
+compass.init();
+compass.enableDefault();
+
+// Comenzamos el sensor DHT
+//dht.begin();
+dht.setup(dhtPin, DHTesp::DHT11); // for DHT11 connect DHT sensor to GPIO 14
+//dht.setup(DHTpin, DHTesp::DHT22); //for DHT22 Connect DHT sensor to GPIO 14
+  
+  /*
+  Calibration values; the default values of +/-32767 for each axis
+  lead to an assumed magnetometer bias of 0. Use the Calibrate example
+  program to determine appropriate values for your particular unit.
+  */
+compass.m_min = (LSM303::vector<int16_t>){-32767, -32767, -32767};
+compass.m_max = (LSM303::vector<int16_t>){+32767, +32767, +32767};
+
+// make the pushbutton's pin an input:
+pinMode(SwitchDownPin, INPUT);
+pinMode(SwitchUpPin, INPUT);
+
+// make the pin 19 an output to activate Relay1:
+ 
+pinMode(Rele1Pin,OUTPUT);
+
+/***************** FIN de set up del shutter
+///////////////////////
 */
 
-#pragma endregion
-
-	
-	// Habilitar WatchDog
-	wdt_enable(WDTO_500MS);
-	
 
 }
 
+#pragma endregion
+
+#pragma region Compuerta
+//  Codigo de la compuerta en el loop
+void Compuerta() {
+	
+	
+compass.read();
+
+  
+  
+  /*
+  When given no arguments, the heading() function returns the angular
+  difference in the horizontal plane between a default vector and
+  north, in degrees.
+  
+  The default vector is chosen by the library to point along the
+  surface of the PCB, in the direction of the top of the text on the
+  silkscreen. This is the +X axis on the Pololu LSM303D carrier and
+  the -Y axis on the Pololu LSM303DLHC, LSM303DLM, and LSM303DLH
+  carriers.
+  
+  To use a different vector as a reference, use the version of heading()
+  that takes a vector argument; for example, use
+  
+    compass.heading((LSM303::vector<int>){0, 0, 1});
+  
+  to use the +Z axis as a reference.
+  */
+float heading = compass.heading();
+  // Compass heading display
+  
+Serial.print("Rumbo: ");
+Serial.print(heading);
+Serial.print("\t");
+ 
+// Leemos la humedad relativa del DHT11
+// Reading temperature and humidity takes about 250 milliseconds!
+// Sensor readings may also be up to 2 seconds 'old' (it's a very slow sensor)
+TempAndHumidity lastValues = dht.getTempAndHumidity();
+
+Serial.print("Temperature: " + String(lastValues.temperature,0));
+Serial.print("\t");
+Serial.print("Humidity: " + String(lastValues.humidity,0));
+Serial.print("\t");
+ 
+delay(1000);
+  
+ // Show if switch is connected or not. Shutter closed or opened. If those values are 0, the shutter is in anywhere between.
+Value1=digitalRead(SwitchDownPin);
+Value2=digitalRead(SwitchUpPin);
+// Test of relay1. If switchDown start. Control of these relays comes from MQTT
+
+digitalWrite(Rele1Pin,Value1); // Set relay on, if switch is on. /// In final SW send another parameter from Visual C# to turn on this relay
+digitalWrite(ledPin,Value1);
+  // print out the state of the button:
+  
+
+ 
+
+
+Serial.print("Compuerta cerrada: ");
+Serial.print(Value1); 
+Serial.print("\t");
+Serial.print("Compuerta abierta: ");
+Serial.print(Value2);
+Serial.print("\t"); 
+Serial.print("Relé 1 On/off ");
+Serial.println(Value1);
+    
+delay(500); 
+  
+ // Serial.print("Hello from DFRobot ESP-WROOM-32");
+//digitalWrite (ledPin, HIGH);  // turn on the LED
+ // delay(4000);
+ // digitalWrite (ledPin, LOW); // turn off the LED
+  //Serial.println("Hola mundo");
+//delay(2000); // wait for half a second or 500 milliseconds
+  
+	
+	
+	
+	
+}
+#pragma endregion
+
+#pragma region Funcion Loop() de ARDUINO
 
 // Funcion LOOP de Arduino
 void loop() {
-
-
-	// Loop de los debouncers
-	Debouncer_HomeSwitch.update();
-	
-
-	// Loop del objeto Cupula
-//	MiCupula.Run();
-
-  // Loop del objeto Shutter. Movimientos de la compuerta
-   MoveShutter();
-
-   // Sensores de Shutter Temperatura, humedad, Azimut
-
-   SensoresShutter();
 		
-	
-	// Loop del cliente MQTT
-	ClienteMQTT.loop();
-	   
+		// Esto si que me suaviza el golpe motor.	
+		//portDISABLE_INTERRUPTS();
 
-	// Loop del Controlador del Stepper
-	//ControladorStepper.run(); // Esto hay que llamar para que "run ...."
+		// Solo la funcion de la libreria del Stepper que se come un nucleo casi.
+		//ControladorStepper.run();
 
 
-	// Loop de leer comandos por el puerto serie
-	serial_commands_.ReadSerial();
-
-		
-	// Resetear contador de WatchDog
-	wdt_reset();
-
+		//portENABLE_INTERRUPTS();
+	Compuerta();
 }
 
 #pragma endregion
